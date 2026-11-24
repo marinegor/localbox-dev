@@ -13,16 +13,12 @@ Each box is named `<repo>-localbox` and mounts `$PWD` at `/home/dev/<repo>` insi
 
 - macOS with [Podman](https://podman.io/) installed and a working Podman machine.
 - SSH key at `~/.ssh/id_ed25519.pub` (or set `LOCALBOX_PUBKEY`).
-- For the TypeScript CLI: [Bun](https://bun.sh/).
-- For the Python CLI: [uv](https://docs.astral.sh/uv/).
+- [uv](https://docs.astral.sh/uv/) to install the CLI.
+- For AWS/Bedrock: [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) on the Mac, with an SSO profile in `~/.aws/config`.
 
 ## Install
 
 ```sh
-# TypeScript / Bun
-bun install -g /path/to/this/repo
-
-# Python / uv
 uv tool install /path/to/this/repo/localbox-cli
 ```
 
@@ -47,7 +43,30 @@ localbox display   # show the ssh command without changing anything
 localbox delete    # remove the box; the host folder is kept
 ```
 
+Subcommands can be abbreviated to any unambiguous prefix: `localbox cr`, `localbox co`, `localbox di`, `localbox de`.
+
 Once connected, you land in `/home/dev/<repo>` with zsh.
+
+## Logins: `localbox-login`
+
+The image ships `localbox-login`. `localbox create` runs it once; run it again inside the box whenever a login expires.
+
+```sh
+localbox-login            # gh + AWS SSO (skips logins that are still valid)
+localbox-login gh         # only GitHub
+localbox-login aws        # only AWS SSO
+localbox-login --force    # log in again even if still valid
+```
+
+Both use device-code flows: open the printed URL on the Mac and enter the code. Failures are never fatal; the box works without them.
+
+## AWS / Bedrock
+
+- `create` copies the `[profile security-1-bedrock-models]` section of your `~/.aws/config` into the box and passes the profile name to it as `LOCALBOX_AWS_PROFILE`. Set `LOCALBOX_AWS_PROFILE` on the Mac to use another profile.
+- `create` also copies your `~/.config/opencode/opencode.json` to the same path in the box (region, profile and model list for Bedrock). Set `LOCALBOX_OPENCODE_CONFIG` to copy another file.
+- `connect` forwards short-lived credentials from your shell (`aws configure export-credentials`) as environment variables. Nothing is written to disk.
+- `LOCALBOX_NO_AWS=1` skips the AWS login, the config copy and the credential forwarding. `LOCALBOX_NO_LOGIN=1` skips `localbox-login` on create entirely.
+- `aws sso login` needs AWS CLI **v2** in the image (the PyPI `awscli` is v1 and has no `sso` login).
 
 ## SSH / Git
 

@@ -5,23 +5,36 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
-USAGE = """Usage: localbox <connect|create|display|delete>
-
-Run from inside a repository. The box is named <repo>-localbox and mounts
-the current directory at /home/dev/<repo>.
-
-  create   start a new box from {image}
-  connect  start (if stopped) and ssh into the box
-  display  show the ssh command for this box (changes nothing)
-  delete   remove the box; the host directory is kept
-
-Environment:
-  LOCALBOX_IMAGE   image to run (default: devbox-base)
-  LOCALBOX_PUBKEY  public key to authorize (default: ~/.ssh/id_ed25519.pub)
-"""
+import typer
+from typer.core import TyperGroup
 
 CONF_INCLUDE = "Include ~/.ssh/localbox.d/*.conf"
+
+# variables sent to the box over ssh (SendEnv); the image's sshd must AcceptEnv them.
+# AWS_PROFILE is deliberately absent: the box has no ~/.aws, a profile name would break it.
+AWS_FORWARD = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_CREDENTIAL_EXPIRATION",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_USE_BEDROCK",
+)
+
+
+# profile logged into with `aws sso login` inside the box on create
+AWS_SSO_PROFILE = os.environ.get("LOCALBOX_AWS_PROFILE", "security-1-bedrock-models")
+
+
+OPENCODE_CONFIG = Path(
+    os.environ.get(
+        "LOCALBOX_OPENCODE_CONFIG", Path.home() / ".config" / "opencode" / "opencode.json"
+    )
+)
 
 
 def die(msg: str) -> "None":
@@ -43,9 +56,13 @@ class Box:
         self.mount_dir = f"/home/dev/{repo}"
         self.conf_path = self.conf_dir / f"{self.name}.conf"
 
-    def podman(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def podman(
+        self, *args: str, check: bool = True, input: "str | None" = None
+    ) -> subprocess.CompletedProcess:
         try:
-            r = subprocess.run(["podman", *args], capture_output=True, text=True)
+            r = subprocess.run(
+                ["podman", *args], capture_output=True, text=True, input=input
+            )
         except FileNotFoundError:
             die("podman not found on PATH")
         if check and r.returncode != 0:
@@ -96,6 +113,7 @@ class Box:
             f"  ForwardAgent yes\n"
             f"  AddKeysToAgent yes\n"
             f"  RequestTTY yes\n"
+            f"  SendEnv {' '.join(AWS_FORWARD)}\n"
             f"  RemoteCommand cd {self.mount_dir} && exec zsh -l\n"
             f"  UserKnownHostsFile /dev/null\n"
             f"  StrictHostKeyChecking no\n"
@@ -114,6 +132,137 @@ class Box:
                 return
             time.sleep(1)
         die(f"sshd in {self.name} did not become ready")
+
+    @staticmethod
+    def aws(*args: str) -> "subprocess.CompletedProcess | None":
+        try:
+            return subprocess.run(
+                ["aws", *args], capture_output=True, text=True, timeout=30
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+    def load_aws_env(self) -> None:
+        """Put AWS credentials into our own environment so `ssh` forwards them.
+
+        Never fatal: connecting must work without AWS. Secrets stay in memory and
+        in the ssh environment; they are not put on a command line or written to disk.
+        """
+        if os.environ.get("LOCALBOX_NO_AWS"):
+            return
+
+        # already exported (static keys, bearer token): forward as they are
+        if not (
+            os.environ.get("AWS_ACCESS_KEY_ID")
+            or os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+        ):
+            r = self.aws("configure", "export-credentials", "--format", "env-no-export")
+            if r is None or r.returncode != 0:
+                if r is not None:
+                    print(
+                        "localbox: AWS credentials not forwarded "
+                        "(expired SSO? run `aws sso login`; LOCALBOX_NO_AWS=1 silences this)",
+                        file=sys.stderr,
+                    )
+                return
+            for line in r.stdout.splitlines():
+                key, _, value = line.removeprefix("export ").partition("=")
+                key, value = key.strip(), value.strip().strip("'\"")
+                if key in AWS_FORWARD and value:
+                    os.environ[key] = value
+
+        if not (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")):
+            r = self.aws("configure", "get", "region")
+            if r is not None and r.returncode == 0 and r.stdout.strip():
+                os.environ["AWS_REGION"] = r.stdout.strip()
+
+    @staticmethod
+    def host_aws_profile_config(profile: str) -> str:
+        """The `[profile <name>]` section (and its sso-session, if any) of the host's aws config."""
+        cfg = Path(os.environ.get("AWS_CONFIG_FILE", Path.home() / ".aws" / "config"))
+        if not cfg.is_file():
+            return ""
+        sections: "dict[str, list[str]]" = {}
+        current = None
+        for line in cfg.read_text().splitlines():
+            m = re.match(r"\s*\[(.+?)\]\s*$", line)
+            if m:
+                current = " ".join(m.group(1).split())
+                sections[current] = [line.strip()]
+            elif current is not None:
+                sections[current].append(line.rstrip())
+
+        wanted = [f"profile {profile}"]
+        for line in sections.get(wanted[0], []):
+            key, _, value = line.partition("=")
+            if key.strip() == "sso_session":
+                wanted.append(f"sso-session {value.strip()}")
+        return "".join("\n".join(sections[w]).rstrip() + "\n\n" for w in wanted if w in sections)
+
+    def copy_opencode_config(self) -> None:
+        """Copy the host's opencode.json into the box (Bedrock region, profile and model list).
+
+        Never fatal: the box is already created and usable without it.
+        """
+        if os.environ.get("LOCALBOX_NO_AWS"):
+            return
+        if not OPENCODE_CONFIG.is_file():
+            print(
+                f"localbox: skipping opencode config copy ({OPENCODE_CONFIG} not found; "
+                f"set LOCALBOX_OPENCODE_CONFIG)",
+                file=sys.stderr,
+            )
+            return
+        r = self.podman(
+            "exec", "-i", "-u", "dev", self.name,
+            "sh", "-c", "mkdir -p ~/.config/opencode && cat > ~/.config/opencode/opencode.json",
+            input=OPENCODE_CONFIG.read_text(),
+            check=False,
+        )
+        if r.returncode != 0:
+            print(f"localbox: opencode config copy failed: {r.stderr.strip()}", file=sys.stderr)
+
+    def write_aws_config(self) -> None:
+        """Copy the host's SSO profile section into the box so `localbox-login` can use it."""
+        config = self.host_aws_profile_config(AWS_SSO_PROFILE)
+        if not config:
+            print(
+                f"localbox: profile {AWS_SSO_PROFILE} not found in ~/.aws/config; "
+                f"AWS login will be skipped (set LOCALBOX_AWS_PROFILE)",
+                file=sys.stderr,
+            )
+            return
+        self.podman(
+            "exec", "-i", "-u", "dev", self.name,
+            "sh", "-c", "mkdir -p ~/.aws && cat > ~/.aws/config",
+            input=config,
+            check=False,
+        )
+
+    def login(self) -> None:
+        """Run `localbox-login` (gh + AWS SSO, device-code flows) inside the box.
+
+        Never fatal: the box is already created and usable without it.
+        """
+        if os.environ.get("LOCALBOX_NO_LOGIN"):
+            return
+        no_aws = bool(os.environ.get("LOCALBOX_NO_AWS"))
+        if not no_aws:
+            self.write_aws_config()
+
+        print(f"logging in inside {self.name}; open the URLs below on this machine")
+        r = subprocess.run(
+            [
+                "podman", "exec", "-it" if sys.stdin.isatty() else "-i", "-u", "dev", self.name,
+                "localbox-login", "gh" if no_aws else "all",
+            ]
+        )
+        if r.returncode != 0:
+            print(
+                f"localbox: login did not complete; retry inside the box with `localbox-login` "
+                f"(an image without it needs a rebuild)",
+                file=sys.stderr,
+            )
 
     def check_uid(self) -> None:
         fmt = '{{index .Config.Labels "localbox.uid"}}'
@@ -141,6 +290,7 @@ class Box:
             "--label", "localbox=true",
             "--label", f"localbox.inode={self.mount_inode()}",
             "-p", "127.0.0.1::22",
+            "-e", f"LOCALBOX_AWS_PROFILE={AWS_SSO_PROFILE}",
             "-e", f"SSH_PUBKEY={self.pubkey.read_text().strip()}",
             "-v", f"{self.cwd}:{self.mount_dir}",
             self.image,
@@ -149,6 +299,8 @@ class Box:
         self.write_ssh_conf(self.host_port())
         self.wait_ssh()
         print(f"created {self.name} (mounted {self.cwd} at {self.mount_dir})")
+        self.copy_opencode_config()
+        self.login()
         print("connect with: localbox connect")
 
     def connect(self) -> None:
@@ -161,6 +313,10 @@ class Box:
         self.ensure_include()
         self.write_ssh_conf(self.host_port())
         self.wait_ssh()
+        self.load_aws_env()
+        # a user-level `SendEnv AWS_*` would otherwise leak the profile name
+        for var in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
+            os.environ.pop(var, None)
         os.execvp("ssh", ["ssh", self.name])
 
     def display(self) -> None:
@@ -198,15 +354,76 @@ class Box:
         print(f"deleted {self.name} (files in {self.cwd} kept)")
 
 
+class PrefixGroup(TyperGroup):
+    """Accept any unambiguous prefix of a subcommand, e.g. `cr` for `create`."""
+
+    def get_command(self, ctx: Any, cmd_name: str):
+        cmd = super().get_command(ctx, cmd_name)
+        if cmd is not None:
+            return cmd
+        matches = [n for n in self.list_commands(ctx) if n.startswith(cmd_name)]
+        if len(matches) > 1:
+            ctx.fail(f"ambiguous command '{cmd_name}': could be {', '.join(sorted(matches))}")
+        return super().get_command(ctx, matches[0]) if matches else None
+
+    def resolve_command(self, ctx: Any, args: "list[str]"):
+        _, cmd, rest = super().resolve_command(ctx, args)
+        return (cmd.name if cmd else None), cmd, rest
+
+
+app = typer.Typer(
+    cls=PrefixGroup,
+    help=(
+        "Per-repo rootless Podman dev box you can ssh into.\n\n"
+        "Run from inside a repository. The box is named <repo>-localbox and mounts "
+        "the current directory at /home/dev/<repo>. "
+        "Subcommands can be abbreviated to any unambiguous prefix (cr, co, di, de)."
+    ),
+    epilog=(
+        "Environment:\n\n"
+        "LOCALBOX_IMAGE: image to run (default: devbox-base)\n\n"
+        "LOCALBOX_PUBKEY: public key to authorize (default: ~/.ssh/id_ed25519.pub)\n\n"
+        "LOCALBOX_OPENCODE_CONFIG: opencode.json copied into the box on create (default: ~/.config/opencode/opencode.json)\n\n"
+        "LOCALBOX_AWS_PROFILE: SSO profile to log into on create (default: security-1-bedrock-models)\n\n"
+        "LOCALBOX_NO_AWS: set to 1 to skip AWS login and the opencode.json copy on create, and credential forwarding on connect\n\n"
+        "LOCALBOX_NO_LOGIN: set to 1 to skip `localbox-login` (gh and AWS) on create"
+    ),
+    no_args_is_help=True,
+    add_completion=False,
+    rich_markup_mode=None,
+)
+
+
+@app.command()
+def create() -> None:
+    """Start a new box, copy your opencode.json into it and run `localbox-login` (gh + AWS SSO) there."""
+    Box().create()
+
+
+@app.command()
+def connect() -> None:
+    """Start (if stopped) and ssh into the box.
+
+    Forwards AWS/Bedrock credentials from your shell (SSO ones via
+    `aws configure export-credentials`) as environment variables; nothing is copied.
+    """
+    Box().connect()
+
+
+@app.command()
+def display() -> None:
+    """Show the ssh command for this box (changes nothing)."""
+    Box().display()
+
+
+@app.command()
+def delete() -> None:
+    """Remove the box; the host directory is kept."""
+    Box().delete()
+
+
 def main() -> None:
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd not in ("create", "connect", "display", "delete"):
-        print(USAGE.format(image=os.environ.get("LOCALBOX_IMAGE", "devbox-base")))
-        sys.exit(1)
-    try:
-        getattr(Box(), cmd)()
-    except KeyboardInterrupt:
-        sys.exit(130)
+    app()
 
 
 if __name__ == "__main__":

@@ -44,11 +44,6 @@ RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
 RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
     --mount=type=cache,target=/opt/cargo/git,sharing=locked \
     --mount=type=cache,target=/cargo-target,sharing=locked \
-    cargo install --locked --root /opt/tools --target-dir /cargo-target tirith
-
-RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/opt/cargo/git,sharing=locked \
-    --mount=type=cache,target=/cargo-target,sharing=locked \
     cargo install --locked --root /opt/tools --target-dir /cargo-target eza
 
 RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
@@ -82,6 +77,11 @@ RUN if id -u ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi; \
 
 RUN mkdir -p /run/sshd \
  && printf 'PasswordAuthentication no\nPermitRootLogin no\nAllowUsers dev\n' > /etc/ssh/sshd_config.d/10-devbox.conf
+
+# AWS CLI v2 (the PyPI awscli is v1 and has no `aws sso login`)
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscli.zip \
+ && unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install \
+ && rm -rf /tmp/aws /tmp/awscli.zip
 
 COPY --from=rust-tools /opt/tools/bin/ /usr/local/bin/
 
@@ -130,6 +130,10 @@ USER root
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 755 /usr/local/bin/entrypoint.sh
 
+# re-runnable gh + AWS SSO login, also run by `localbox create`
+COPY localbox-login /usr/local/bin/localbox-login
+RUN chmod 755 /usr/local/bin/localbox-login
+
 # sshd sessions don't inherit ENV from the image; pam_env reads /etc/environment
 RUN printf '%s\n' \
       'PATH=/home/dev/.local/bin:/home/dev/.pixi/bin:/home/dev/.bun/bin:/home/dev/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
@@ -138,6 +142,16 @@ RUN printf '%s\n' \
       'VISUAL=vim' \
       'STARSHIP_CONFIG=/home/dev/.config/starship.toml' \
       > /etc/environment
+
+# forward AWS/Bedrock credentials from the client's environment (SendEnv on the Mac)
+RUN printf 'AcceptEnv AWS_* CLAUDE_CODE_USE_BEDROCK\n' > /etc/ssh/sshd_config.d/20-devbox-env.conf
+
+# ssh sessions get LANG/TERM from the client; force a UTF-8 locale and fall back
+# to xterm-256color when the client's terminfo (e.g. xterm-ghostty) isn't installed
+RUN printf '%s\n' \
+      'export LANG=C.UTF-8 LC_ALL=C.UTF-8' \
+      'if [[ -n $TERM ]] && ! infocmp "$TERM" >/dev/null 2>&1; then export TERM=xterm-256color; fi' \
+      >> /etc/zsh/zshenv
 
 # dotfiles zshrc/bashrc source this (uv's installer skips it when ~/.local/bin is already on PATH)
 RUN printf '%s\n' 'case ":${PATH}:" in *:"$HOME/.local/bin":*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac' \

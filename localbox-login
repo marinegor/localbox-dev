@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Log into GitHub (gh) and AWS SSO (Bedrock) from inside a localbox.
+# Runs automatically on `localbox create`; re-run it by hand when a login expires.
+set -u
+
+usage() {
+  cat <<EOF
+Usage: localbox-login [-f|--force] [gh|aws|all]
+
+  gh    gh auth login (device flow, git over ssh)
+  aws   aws sso login for the Bedrock profile (device-code flow)
+  all   both (default)
+
+Already valid logins are skipped unless --force is given.
+Open the printed URL on your host machine and enter the code.
+
+Environment:
+  LOCALBOX_AWS_PROFILE  SSO profile to log into (default: security-1-bedrock-models)
+EOF
+}
+
+PROFILE="${LOCALBOX_AWS_PROFILE:-security-1-bedrock-models}"
+force=0
+targets=()
+for arg in "$@"; do
+  case "$arg" in
+    -f | --force) force=1 ;;
+    -h | --help) usage; exit 0 ;;
+    gh | aws) targets+=("$arg") ;;
+    all) targets+=(gh aws) ;;
+    *) echo "localbox-login: unknown argument '$arg'" >&2; usage >&2; exit 2 ;;
+  esac
+done
+[ ${#targets[@]} -eq 0 ] && targets=(gh aws)
+
+warn() { echo "localbox-login: $*" >&2; }
+
+login_gh() {
+  command -v gh >/dev/null || { warn "gh not installed"; return 1; }
+  if [ "$force" = 0 ] && gh auth status -h github.com >/dev/null 2>&1; then
+    echo "gh: already logged in"
+    return 0
+  fi
+  echo "gh: logging in to github.com"
+  gh auth login -h github.com -p ssh -w --skip-ssh-key
+}
+
+login_aws() {
+  command -v aws >/dev/null || { warn "aws not installed"; return 1; }
+  # `aws sso login` only exists in AWS CLI v2
+  case "$(aws --version 2>&1)" in aws-cli/2*) ;; *) warn "AWS CLI v2 required (rebuild the image)"; return 1 ;; esac
+  if ! grep -q "^\[profile $PROFILE\]" "$HOME/.aws/config" 2>/dev/null; then
+    warn "profile '$PROFILE' not in ~/.aws/config (run \`localbox create\` from the host, or set LOCALBOX_AWS_PROFILE)"
+    return 1
+  fi
+  if [ "$force" = 0 ] && aws sts get-caller-identity --profile "$PROFILE" >/dev/null 2>&1; then
+    echo "aws: already logged in ($PROFILE)"
+    return 0
+  fi
+  echo "aws: logging in to SSO profile $PROFILE"
+  aws sso login --profile "$PROFILE" --no-browser --use-device-code
+}
+
+status=0
+for t in "${targets[@]}"; do
+  "login_$t" || { warn "$t login did not complete"; status=1; }
+done
+exit "$status"
